@@ -4,6 +4,11 @@ numpy
 matplotlib
 fpdf
 geopy
+PyMuPDF
+pytesseract
+pdf2image
+Pillow
+
 
 
 
