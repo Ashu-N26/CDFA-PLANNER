@@ -1,9 +1,9 @@
-streamlit>=1.0
+pdf2image
+pytesseract
 pandas
 numpy
 matplotlib
-pdf2image
-pytesseract
 fpdf
+
 
 
