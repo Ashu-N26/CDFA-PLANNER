@@ -1,12 +1,12 @@
 streamlit
 pandas
 numpy
-matplotlib
 fpdf
-PyMuPDF
 pdf2image
+PyMuPDF
 pytesseract
 Pillow
+
 
 
 
