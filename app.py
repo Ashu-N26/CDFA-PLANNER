@@ -5,146 +5,206 @@ import math
 from io import BytesIO
 from fpdf import FPDF
 import base64
-from pdf_parser import parse_pdf_chart
+import matplotlib.pyplot as plt
+import pytesseract
+from PIL import Image
+import fitz  # PyMuPDF
+import os
 
-st.set_page_config(layout="wide")
-st.title("CDFA-PLANNER")
+st.set_page_config(page_title="CDFA-PLANNER", layout="centered")
 
-# -------------------- INPUTS --------------------
+st.title("🛬 CDFA-PLANNER")
 
-st.header("1️⃣ INPUT PANEL")
+st.markdown("""
+Use this tool to plan a Continuous Descent Final Approach (CDFA) for non-precision approaches.  
+Supports automated PDF parsing or manual input for accurate DME and ROD tables.
+""")
 
-col1, col2 = st.columns(2)
-with col1:
-    thr_lat = st.text_input("THR Latitude", "12.982")
-    thr_lon = st.text_input("THR Longitude", "77.607")
-    thr_elev = st.number_input("THR / TDZE Elevation (ft)", value=300)
+# ------------------------- PDF PARSER -------------------------------------
+def extract_text_from_pdf(uploaded_pdf):
+    pdf_bytes = uploaded_pdf.read()
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    images = []
+    for page in doc:
+        pix = page.get_pixmap(dpi=300)
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        images.append(img)
+    text = "\n".join(pytesseract.image_to_string(img) for img in images[:2])
+    return text
 
-    dme_lat = st.text_input("DME Latitude", "12.990")
-    dme_lon = st.text_input("DME Longitude", "77.600")
-
-    dme_thr = st.number_input("DME at THR (NM)", value=0.5)
-    dme_mapt = st.number_input("DME at MAPt (NM)", value=1.2)
-    tod_alt = st.number_input("Top of Descent Altitude (FT)", value=3000)
-    mda = st.number_input("Minimum Descent Altitude (MDA) (FT)", value=1000)
-
-with col2:
-    gp_angle = st.text_input("Glide Path Angle (deg) (optional)", "")
-    faf_mapt = st.number_input("FAF to MAPt Distance (NM)", value=2.0)
-
-    sdf_data = []
-    sdf_count = st.number_input("Number of SDFs (Step-Down Fixes)", min_value=0, max_value=6, value=1)
-    for i in range(int(sdf_count)):
-        col_sdf1, col_sdf2 = st.columns(2)
-        with col_sdf1:
-            sdf_dist = st.number_input(f"SDF {i+1} Distance (NM)", key=f"dist_{i}", value=3.5 - i)
-        with col_sdf2:
-            sdf_alt = st.number_input(f"SDF {i+1} Altitude (FT)", key=f"alt_{i}", value=1500 - 200 * i)
-        sdf_data.append((sdf_dist, sdf_alt))
-
-st.markdown("#### 📎 Optional: Upload AIP/IAC Chart PDF")
-uploaded_pdf = st.file_uploader("Upload Approach Chart (PDF)", type="pdf")
-
-if uploaded_pdf:
+def parse_chart(text):
+    parsed = {}
     try:
-        extracted = parse_pdf_chart(uploaded_pdf)
-        st.success("✅ Parsed PDF Chart Data")
-        st.write(extracted)
-        # Auto-fill inputs (this assumes dictionary keys match)
-        if extracted.get("gp_angle"):
-            gp_angle = extracted["gp_angle"]
-        if extracted.get("tod_alt"):
-            tod_alt = extracted["tod_alt"]
-        if extracted.get("mda"):
-            mda = extracted["mda"]
+        for line in text.splitlines():
+            if "GP ANGLE" in line.upper():
+                parsed['gp_angle'] = float(next(filter(str.isdigit, line.split())))
+            if "TOP OF DESCENT" in line.upper() or "TOD" in line:
+                parsed['tod_alt'] = int(''.join(filter(str.isdigit, line)))
+            if "MDA" in line and "CAT" in line:
+                parsed['mda'] = int(''.join(filter(str.isdigit, line)))
+    except:
+        pass
+    return parsed
+
+# ------------------------ INPUT PANEL --------------------------------------
+
+st.subheader("✈️ Inputs")
+
+pdf_uploaded = st.file_uploader("Optional: Upload IAC PDF chart", type=["pdf"])
+
+parsed_data = {}
+if pdf_uploaded:
+    try:
+        text = extract_text_from_pdf(pdf_uploaded)
+        parsed_data = parse_chart(text)
+        st.success("✅ PDF parsed. You can adjust values below.")
     except Exception as e:
-        st.warning("PDF Parsing failed. You can manually enter data.")
+        st.warning("⚠️ PDF Parsing failed. You can manually enter data.")
 
-# -------------------- GP ANGLE GENERATION --------------------
+# Threshold (THR)
+st.markdown("#### Threshold (THR) Coordinates")
+thr_lat = st.text_input("THR Latitude", "18.5822")
+thr_lon = st.text_input("THR Longitude", "73.9197")
 
-def compute_gp_angle(tod_alt, mda, tod_dme, mda_dme):
-    delta_alt = tod_alt - mda
-    delta_dme = (tod_dme - mda_dme) * 1.852 * 1852  # NM to meters
-    angle_rad = math.atan(delta_alt / delta_dme)
-    return round(math.degrees(angle_rad), 2)
+# TDZE
+tdze = st.number_input("THR/TDZE Elevation (ft)", value=75)
 
-try:
-    gp_angle_val = float(gp_angle)
-except:
-    gp_angle_val = compute_gp_angle(tod_alt, mda, sdf_data[0][0] if sdf_data else dme_mapt + 2.0, dme_mapt)
-    st.info(f"Auto-calculated GP angle: {gp_angle_val}°")
+# DME
+st.markdown("#### DME Station Coordinates")
+dme_lat = st.text_input("DME Latitude", "18.5994")
+dme_lon = st.text_input("DME Longitude", "73.9125")
 
-# -------------------- DME + ALT TABLE GENERATION --------------------
+dme_thr = st.number_input("DME at THR (NM)", value=2.8)
+dme_mapt = st.number_input("DME at MAPT (NM)", value=1.1)
 
-def generate_dme_table(tod_alt, mda, tod_dme, mda_dme, sdf_data):
-    dmes = [round(x, 1) for x in np.linspace(tod_dme, mda_dme, 8)]
-    alts = []
-    for d in dmes:
-        alt = tod_alt - (tod_alt - mda) * ((tod_dme - d) / (tod_dme - mda_dme))
-        # apply step-down fix restrictions
-        for sdf_d, sdf_a in sdf_data:
-            if d <= sdf_d:
-                alt = max(alt, sdf_a)
-        alts.append(int(round(alt, -1)))
-    return pd.DataFrame({"DME (NM)": dmes, "Altitude (FT)": alts})
+# Glide Path Angle (optional)
+gp_angle = st.number_input("Glide Path Angle (°)", value=parsed_data.get('gp_angle', 0.0), help="Optional. Will auto-calculate if blank.")
 
-dme_df = generate_dme_table(tod_alt, mda, sdf_data[0][0] if sdf_data else dme_mapt + 2.0, dme_mapt, sdf_data)
+# Altitudes
+tod_alt = st.number_input("Top of Descent Altitude (TOD, ft)", value=parsed_data.get('tod_alt', 3000))
+mda = st.number_input("Minimum Descent Altitude (MDA, ft)", value=parsed_data.get('mda', 1000))
 
-# -------------------- ROD TABLE --------------------
+# SDF input (up to 6 optional)
+st.markdown("#### Step-Down Fixes (Optional)")
+sdf_count = st.number_input("Number of SDFs (max 6)", min_value=0, max_value=6, value=2)
+sdf_inputs = []
+for i in range(sdf_count):
+    col1, col2 = st.columns(2)
+    with col1:
+        dist = st.number_input(f"SDF {i+1} Distance (NM)", value=6.0 - i, key=f"sdf_d_{i}")
+    with col2:
+        alt = st.number_input(f"SDF {i+1} Altitude (ft)", value=mda + 500 + (i * 100), key=f"sdf_a_{i}")
+    sdf_inputs.append((round(dist, 1), alt))
 
-def generate_rod_table(angle, faf_dist):
+# FAF to MAPT distance
+faf_mapt = st.number_input("FAF to MAPT Distance (NM)", value=5.0)
+
+# -------------------------- CDFA CALCULATION LOGIC -----------------------------
+
+def compute_gp_angle(tod_alt, mda, tod_dist):
+    try:
+        angle_rad = math.atan((tod_alt - mda) / (tod_dist * 6076.12))
+        return round(math.degrees(angle_rad), 2)
+    except:
+        return 3.0
+
+def generate_dme_table(tod_alt, mda, dme_thr, dme_mapt, sdf_inputs):
+    table = []
+    total_distance = dme_thr - dme_mapt
+    gp_angle_local = compute_gp_angle(tod_alt, mda, total_distance)
+
+    dme_points = [round(dme_thr - i, 1) for i in range(8)]
+    for d in dme_points:
+        if d < dme_mapt:
+            continue
+        h = tod_alt - (dme_thr - d) * 6076.12 * math.tan(math.radians(gp_angle_local))
+        h = max(h, mda)
+        h = round(h)
+        table.append((d, h))
+    return table, gp_angle_local
+
+def generate_rod_table(gp_angle, faf_dist):
     speeds = [80, 100, 120, 140, 160]
-    data = []
-    for spd in speeds:
-        vs = int(round(101.27 * spd * math.tan(math.radians(angle))))
-        time = round((faf_dist / spd) * 60, 1)
-        data.append((f"{spd} kt", f"{vs} fpm", f"{time} sec"))
-    return pd.DataFrame(data, columns=["GS", "ROD", "Time"])
+    rod_data = []
+    for gs in speeds:
+        fpm = round(gs * 101.27 * math.tan(math.radians(gp_angle)))
+        time_sec = round((faf_dist / gs) * 3600)
+        rod_data.append((gs, fpm, f"{time_sec//60}:{str(time_sec%60).zfill(2)}"))
+    return rod_data
 
-rod_df = generate_rod_table(gp_angle_val, faf_mapt)
+# ----------------------- TABLES + EXPORTS -------------------------------
 
-# -------------------- DISPLAY --------------------
+if st.button("Generate CDFA Tables"):
+    dme_data, final_gp = generate_dme_table(tod_alt, mda, dme_thr, dme_mapt, sdf_inputs)
+    rod_data = generate_rod_table(final_gp, faf_mapt)
 
-st.header("2️⃣ OUTPUT TABLES")
+    st.success(f"✅ CDFA Slope: {final_gp}°")
 
-st.subheader("DME Descent Table")
-st.dataframe(dme_df)
+    dme_df = pd.DataFrame(dme_data, columns=["DME (NM)", "Altitude (ft)"])
+    sdf_labels = dict(sdf_inputs)
+    for i, row in dme_df.iterrows():
+        if round(row["DME (NM)"], 1) in sdf_labels:
+            dme_df.at[i, "Label"] = f"SDF @ {sdf_labels[round(row['DME (NM)'], 1)]} ft"
+        else:
+            dme_df.at[i, "Label"] = ""
 
-st.subheader("Rate of Descent Table")
-st.dataframe(rod_df)
+    rod_df = pd.DataFrame(rod_data, columns=["Ground Speed (kt)", "ROD (ft/min)", "Time (min:sec)"])
 
-# -------------------- EXPORT --------------------
+    st.subheader("📍 DME Table")
+    st.dataframe(dme_df)
 
-def generate_pdf(dme_df, rod_df):
-    pdf = FPDF()
-    pdf.add_page()
-    pdf.set_font("Arial", "B", 14)
-    pdf.cell(0, 10, "CDFA-PLANNER: Descent + ROD Table", ln=True)
+    st.subheader("📈 ROD Table")
+    st.dataframe(rod_df)
 
-    pdf.set_font("Arial", "B", 12)
-    pdf.cell(0, 10, "DME Table", ln=True)
-    pdf.set_font("Arial", "", 11)
-    for idx, row in dme_df.iterrows():
-        pdf.cell(0, 10, f"{row['DME (NM)']} NM - {row['Altitude (FT)']} ft", ln=True)
+    # Plot
+    fig, ax = plt.subplots()
+    ax.plot(dme_df["DME (NM)"], dme_df["Altitude (ft)"], marker='o', label="Glide Path")
+    ax.axhline(y=mda, color='r', linestyle='--', label="MDA")
+    ax.set_xlabel("DME (NM)")
+    ax.set_ylabel("Altitude (ft)")
+    ax.set_title("CDFA Descent Slope")
+    ax.grid(True)
+    ax.legend()
+    st.pyplot(fig)
 
-    pdf.set_font("Arial", "B", 12)
-    pdf.cell(0, 10, "Rate of Descent Table", ln=True)
-    pdf.set_font("Arial", "", 11)
-    for idx, row in rod_df.iterrows():
-        pdf.cell(0, 10, f"{row['GS']} - {row['ROD']} - {row['Time']}", ln=True)
+    # PDF Export
+    def generate_pdf(dme_df, rod_df):
+        pdf = FPDF()
+        pdf.add_page()
+        pdf.set_font("Arial", "B", 16)
+        pdf.cell(200, 10, "CDFA Descent Planner", ln=True, align="C")
+        pdf.ln(10)
 
-    return pdf.output(dest="S").encode("latin1")
+        pdf.set_font("Arial", "B", 12)
+        pdf.cell(0, 10, "DME Table", ln=True)
+        for _, row in dme_df.iterrows():
+            pdf.set_font("Arial", "", 11)
+            label = f" ({row['Label']})" if row['Label'] else ""
+            pdf.cell(0, 8, f"{row['DME (NM)']} NM - {row['Altitude (ft)']} ft{label}", ln=True)
 
-st.subheader("📥 Export Options")
+        pdf.ln(10)
+        pdf.set_font("Arial", "B", 12)
+        pdf.cell(0, 10, "ROD Table", ln=True)
+        for _, row in rod_df.iterrows():
+            pdf.set_font("Arial", "", 11)
+            pdf.cell(0, 8, f"{row['Ground Speed (kt)']} kt - {row['ROD (ft/min)']} ft/min - {row['Time (min:sec)']}", ln=True)
 
-pdf_bytes = generate_pdf(dme_df, rod_df)
-st.download_button("Download PDF", data=pdf_bytes, file_name="CDFA_output.pdf")
+        return pdf.output(dest='S').encode('latin1')
 
-csv_dme = dme_df.to_csv(index=False).encode("utf-8")
-csv_rod = rod_df.to_csv(index=False).encode("utf-8")
+    pdf_bytes = generate_pdf(dme_df, rod_df)
+    b64 = base64.b64encode(pdf_bytes).decode()
+    href = f'<a href="data:application/pdf;base64,{b64}" download="cdfa_output.pdf">📄 Download PDF Report</a>'
+    st.markdown(href, unsafe_allow_html=True)
 
-st.download_button("Download DME Table (CSV)", data=csv_dme, file_name="dme_table.csv")
-st.download_button("Download ROD Table (CSV)", data=csv_rod, file_name="rod_table.csv")
+    # CSV Export
+    csv1 = dme_df.to_csv(index=False)
+    b64_1 = base64.b64encode(csv1.encode()).decode()
+    st.markdown(f'<a href="data:file/csv;base64,{b64_1}" download="DME_Table.csv">📁 Download DME CSV</a>', unsafe_allow_html=True)
+
+    csv2 = rod_df.to_csv(index=False)
+    b64_2 = base64.b64encode(csv2.encode()).decode()
+    st.markdown(f'<a href="data:file/csv;base64,{b64_2}" download="ROD_Table.csv">📁 Download ROD CSV</a>', unsafe_allow_html=True)
+
 
 
 
