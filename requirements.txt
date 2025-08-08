@@ -1,11 +1,14 @@
 streamlit
-fpdf
 matplotlib
+pandas
+fpdf
+pdfplumber
 pytesseract
 Pillow
+scipy
 numpy
-pandas
-PyMuPDF
+opencv-python-headless
+
 
 
 
