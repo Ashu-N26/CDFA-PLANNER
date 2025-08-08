@@ -8,6 +8,8 @@ Pillow
 scipy
 numpy
 opencv-python-headless
+reportlab
+
 
 
 
