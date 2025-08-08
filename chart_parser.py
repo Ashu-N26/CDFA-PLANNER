@@ -1,52 +1,83 @@
-import fitz  # PyMuPDF
+import PyPDF2
 import re
 
-def parse_iac_pdf(file):
-    data = {}
+def parse_iac_pdf(pdf_path):
+    """
+    Parse ICAO Approach Chart (IAC) PDF to extract relevant data for the CDFA planner.
+    
+    :param pdf_path: Path to the IAC PDF file
+    :return: Extracted values as a dictionary
+    """
+    data = {
+        "gp_angle": None,
+        "dme_thr": None,
+        "dme_mapt": None,
+        "tod_altitude": None,
+        "mda": None,
+        "sdf": [],
+        "faf_mapt_dist": None
+    }
+
     try:
-        doc = fitz.open(stream=file.read(), filetype="pdf")
-        text = ""
-        for page in doc:
-            text += page.get_text()
+        with open(pdf_path, "rb") as f:
+            reader = PyPDF2.PdfReader(f)
+            text = ""
+            for page in range(len(reader.pages)):
+                text += reader.pages[page].extract_text()
 
-        # GP angle (e.g. "GP 3.00°" or "Glide Path: 3.00°")
-        gp_match = re.search(r"(GP|Glide Path)[^\d]*(\d+\.\d+)", text)
-        if gp_match:
-            data["gp_angle"] = float(gp_match.group(2))
+            # Extract GP angle
+            gp_match = re.search(r"Glide Path: ([\d.]+)°", text)
+            if gp_match:
+                data["gp_angle"] = float(gp_match.group(1))
 
-        # TOD altitude (e.g. "FAF HESGI 6.9 DME 2500'")
-        tod_match = re.search(r"FAF.*?(\d+\.\d+)\s*DME.*?(\d{3,4})'", text)
-        if tod_match:
-            data["dme_thr"] = float(tod_match.group(1))
-            data["tod_alt"] = int(tod_match.group(2))
+            # Extract DME at THR (Threshold)
+            dme_thr_match = re.search(r"DME at THR: (\d+\.\d+)", text)
+            if dme_thr_match:
+                data["dme_thr"] = float(dme_thr_match.group(1))
 
-        # MDA (e.g. "MDA(H) 1000'")
-        mda_match = re.search(r"MDA.*?(\d{3,4})'", text)
-        if mda_match:
-            data["mda"] = int(mda_match.group(1))
+            # Extract DME at MAPT (Missed Approach Point)
+            dme_mapt_match = re.search(r"DME at MAPT: (\d+\.\d+)", text)
+            if dme_mapt_match:
+                data["dme_mapt"] = float(dme_mapt_match.group(1))
 
-        # MAPt DME (e.g. "MAPt 1.1 DME")
-        mapt_match = re.search(r"MAPt.*?(\d+\.\d+)\s*DME", text)
-        if mapt_match:
-            data["dme_mapt"] = float(mapt_match.group(1))
+            # Extract TOD (Top of Descent) Altitude
+            tod_altitude_match = re.search(r"TOD Altitude: (\d+)", text)
+            if tod_altitude_match:
+                data["tod_altitude"] = int(tod_altitude_match.group(1))
 
-        # FAF–MAPt distance (optional if available)
-        faf_mapt_match = re.search(r"FAF.*?MAPt.*?(\d+\.\d+)\s*NM", text)
-        if faf_mapt_match:
-            data["faf_mapt_dist"] = float(faf_mapt_match.group(1))
-        else:
-            data["faf_mapt_dist"] = round(data.get("dme_thr", 6.9) - data.get("dme_mapt", 1.1), 1)
+            # Extract MDA (Minimum Descent Altitude)
+            mda_match = re.search(r"MDA: (\d+)", text)
+            if mda_match:
+                data["mda"] = int(mda_match.group(1))
 
-        # Placeholder values for lat/lon (manual input expected)
-        data["thr_lat"] = ""
-        data["thr_lon"] = ""
-        data["dme_lat"] = ""
-        data["dme_lon"] = ""
-        data["thr_elev"] = 0
-        data["sdfs"] = []
+            # Extract Step-Down Fixes (SDF)
+            sdf_match = re.findall(r"SDF (\d+): DME (\d+\.\d+) NM, Altitude (\d+)", text)
+            for sdf in sdf_match:
+                data["sdf"].append({
+                    "dme": float(sdf[1]),
+                    "altitude": int(sdf[2])
+                })
+
+            # Extract FAF-MAPT Distance
+            faf_mapt_match = re.search(r"FAF to MAPT: (\d+\.\d+) NM", text)
+            if faf_mapt_match:
+                data["faf_mapt_dist"] = float(faf_mapt_match.group(1))
 
     except Exception as e:
-        print("PDF parsing failed:", e)
-        data = {}
+        print(f"Error reading PDF: {e}")
 
     return data
+
+def extract_values_from_pdf(pdf_path):
+    """
+    This function combines the PDF parser with the app's logic to extract the relevant
+    values and return them in a format ready for use in CDFA calculations.
+    
+    :param pdf_path: Path to the IAC PDF file
+    :return: Parsed values (dictionary)
+    """
+    parsed_data = parse_iac_pdf(pdf_path)
+
+    return parsed_data
+
+
