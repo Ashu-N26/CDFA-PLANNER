@@ -1,8 +1,10 @@
-streamlit
+streamlit>=1.10
 pandas
+numpy
 matplotlib
 reportlab
 PyMuPDF
+
 
 
 
