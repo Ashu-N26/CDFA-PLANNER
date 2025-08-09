@@ -1,22 +1,33 @@
+# Use Python base
 FROM python:3.11-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    poppler-utils \
+# Install system deps for Tesseract OCR and pdf2image
+RUN apt-get update && apt-get install -y \
     tesseract-ocr \
+    poppler-utils \
+    libgl1 \
     libglib2.0-0 \
-    libsm6 \
-    libxext6 \
-    libxrender1 \
     && rm -rf /var/lib/apt/lists/*
 
+# Set workdir
 WORKDIR /app
-COPY requirements.txt /app/
+
+# Copy requirements and install
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py /app/
+# Copy app
+COPY app.py .
 
-ENV PORT=8501
-EXPOSE ${PORT}
+# Streamlit settings (to avoid asking for browser)
+ENV STREAMLIT_SERVER_HEADLESS=true
+ENV STREAMLIT_SERVER_PORT=7860
+ENV STREAMLIT_SERVER_ADDRESS=0.0.0.0
 
-CMD ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0"]
+# Expose port
+EXPOSE 7860
+
+# Run Streamlit
+CMD ["streamlit", "run", "app.py"]
+
 
