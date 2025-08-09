@@ -1,7 +1,7 @@
 # Base Python image
 FROM python:3.11-slim
 
-# Ensure system is up-to-date and install OS deps for OCR + PDF parsing
+# Install OS dependencies for Tesseract OCR, PDF processing, and plotting
 RUN apt-get update && apt-get install -y --no-install-recommends \
     tesseract-ocr \
     poppler-utils \
@@ -9,26 +9,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-# Create app directory
+# Set workdir
 WORKDIR /app
 
-# Copy requirements first (to force re-install if changed)
+# Copy and install Python dependencies
 COPY requirements.txt .
-
-# Force pip to reinstall all packages fresh (no cache, no reuse)
 RUN pip install --upgrade pip && \
     pip install --no-cache-dir --force-reinstall -r requirements.txt
 
 # Copy application code
 COPY app.py .
 
-# Streamlit settings
+# Streamlit configuration
 ENV STREAMLIT_SERVER_HEADLESS=true
 ENV STREAMLIT_SERVER_PORT=7860
 ENV STREAMLIT_SERVER_ADDRESS=0.0.0.0
 
-# Expose the port Render will use
+# Expose port
 EXPOSE 7860
 
 # Run the Streamlit app
 CMD ["streamlit", "run", "app.py"]
+
