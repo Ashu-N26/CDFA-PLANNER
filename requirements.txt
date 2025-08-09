@@ -1,9 +1,11 @@
-streamlit>=1.18
-pandas>=1.5
-numpy>=1.24
-matplotlib>=3.6
-pdfplumber>=0.7.0
-pdf2image>=1.16.0
-pytesseract>=0.3.10
-Pillow>=9.4
+streamlit>=1.33
+pandas>=2.0
+numpy>=1.26
+matplotlib>=3.8
+pdfplumber>=0.11
+pdf2image>=1.17
+pytesseract>=0.3
+reportlab>=4.0
+Pillow>=10.0
+
 
