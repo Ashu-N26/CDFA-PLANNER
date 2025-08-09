@@ -1,331 +1,304 @@
-# app.py
-import streamlit as st
-import pandas as pd
-import numpy as np
+# app.py — Single-file CDFA-PLANNER with OCR fallback and GP safety clamp
+
 import math
-import io
-import datetime
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image
-from reportlab.lib import colors
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import getSampleStyleSheet
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
-import fitz  # PyMuPDF used by parser
-from chart_parser import parse_iac_pdf, haversine_nm
+from io import BytesIO
+import re
+import numpy as np
+import pandas as pd
+from matplotlib import pyplot as plt
+import streamlit as st
+from PIL import Image
 
-st.set_page_config(page_title="CDFA PLANNER", layout="wide")
-st.title("CDFA PLANNER")
+# PDF/text/ocr libs (may be optional on deployment)
+try:
+    import pdfplumber
+except Exception:
+    pdfplumber = None
+try:
+    from pdf2image import convert_from_bytes
+except Exception:
+    convert_from_bytes = None
+try:
+    import pytesseract
+except Exception:
+    pytesseract = None
 
-########################
-# Helper functions
-########################
+# ----- Constants -----
 NM_TO_FT = 6076.12
+KTS_TO_NM_PER_MIN = 1.0 / 60.0  # knot -> NM per min
+KTS_TO_FT_PER_MIN = 101.268     # as used earlier
 
-def angle_from_height_and_distance(ft_diff, dist_nm):
-    """Compute angle in degrees from vertical diff (ft) and horizontal distance (nm)."""
-    if dist_nm <= 0:
-        return None
-    angle_rad = math.atan(ft_diff / (dist_nm * NM_TO_FT))
-    return math.degrees(angle_rad)
+DEFAULT_GP_MIN = 2.5
+DEFAULT_GP_MAX = 3.5
+DEFAULT_GP_FALLBACK = 3.0
 
-def ft_per_nm_from_angle_deg(angle_deg):
-    """Vertical ft per NM for a given approach angle."""
-    return math.tan(math.radians(angle_deg)) * NM_TO_FT
-
-def rod_ft_per_min(angle_deg, gs_kt):
-    """Rate of descent (ft/min) for given approach angle and groundspeed (kt)."""
-    ft_per_nm = ft_per_nm_from_angle_deg(angle_deg)
-    # ft/hr = gs_kt * ft_per_nm -> ft/min = ft/hr / 60
-    return gs_kt * ft_per_nm / 60.0
-
-def round_to_10_up(x):
-    """Round up to next 10 ft per NAVBLUE formatting for timing tables."""
-    return int(math.ceil(x / 10.0) * 10)
-
-def format_nm(nm):
-    return f"{nm:.1f}"
-
-def format_ft(f):
-    return f"{int(round(f))}"
-
-########################
-# Sidebar: PDF upload & parse
-########################
-st.sidebar.header("IAC PDF (optional)")
-uploaded_pdf = st.sidebar.file_uploader("Upload IAC / Approach Chart PDF (optional)", type=["pdf"])
-parsed = {}
-if uploaded_pdf:
-    try:
-        # pass file bytes to parser
-        uploaded_pdf.seek(0)
-        parsed = parse_iac_pdf(uploaded_pdf.read())
-        st.sidebar.success("PDF parsed (values loaded below). You can edit any field.")
-    except Exception as e:
-        st.sidebar.error(f"PDF parsing failed: {e}")
-        parsed = {}
-
-########################
-# Inputs (Main)
-########################
-st.header("Input parameters")
-
-c1, c2 = st.columns(2)
-with c1:
-    thr_lat = st.text_input("THR Latitude (deg)", parsed.get("thr_lat", ""))
-    thr_lon = st.text_input("THR Longitude (deg)", parsed.get("thr_lon", ""))
-    thr_elev = st.number_input("THR / TDZE Elevation (FT)", value=int(parsed.get("thr_elev", 0)), step=1)
-    dme_lat = st.text_input("DME Latitude (deg)", parsed.get("dme_lat", ""))
-    dme_lon = st.text_input("DME Longitude (deg)", parsed.get("dme_lon", ""))
-with c2:
-    dme_at_thr = st.number_input("DME at THR (NM)", value=float(parsed.get("dme_at_thr", 0.0)), format="%.2f", step=0.1)
-    dme_at_mapt = st.number_input("DME at MAPT (NM)", value=float(parsed.get("dme_at_mapt", 0.0)), format="%.2f", step=0.1)
-    tod_alt = st.number_input("TOD Altitude (FT)", value=int(parsed.get("tod_alt", 2500)), step=10)
-    mda = st.number_input("MDA (FT)", value=int(parsed.get("mda", 1000)), step=10)
-
-st.markdown("---")
-# SDFs (dynamic)
-st.subheader("Step-Down Fixes (SDF) — optional (max 6)")
-sdf_count = st.number_input("Number of SDFs", min_value=0, max_value=6, value=int(len(parsed.get("sdfs", []))))
-sdfs = []
-for i in range(int(sdf_count)):
-    col1, col2 = st.columns(2)
-    with col1:
-        d = st.number_input(f"SDF {i+1} DME (NM)", value=float(parsed.get("sdfs", [])[i].get("dme", 0.0) if parsed.get("sdfs") and i < len(parsed.get("sdfs")) else 0.0), format="%.2f", key=f"sdf_dme_{i}")
-    with col2:
-        a = st.number_input(f"SDF {i+1} Alt (FT)", value=int(parsed.get("sdfs", [])[i].get("alt", 0) if parsed.get("sdfs") and i < len(parsed.get("sdfs")) else 0), step=10, key=f"sdf_alt_{i}")
-    sdfs.append({"dme": float(d), "alt": int(a)})
-
-st.markdown("---")
-col1, col2 = st.columns(2)
-with col1:
-    faf_mapt_dist = st.number_input("FAF → MAPt distance (NM) (for ROD timing)", value=float(parsed.get("faf_mapt_dist", 0.0)), format="%.2f", step=0.1)
-with col2:
-    gp_input = st.text_input("Glide Path angle (°) — optional (leave blank to auto compute)", value=str(parsed.get("gp_angle", "") if parsed.get("gp_angle", "") else ""))
-
-calc_button = st.button("Generate CDFA profile")
-
-########################
-# Core calculation flow
-########################
-if calc_button:
-    # Validate minimal fields
-    if tod_alt <= mda:
-        st.error("TOD altitude must be higher than MDA.")
-    else:
-        # Determine horizontal distance to use for GP calculation
-        # Preferred: dme_at_thr - dme_at_mapt  (THR DME minus MAPT DME)
-        # Fallback: faf_mapt_dist (FAF->MAPt)
-        chosen_distance = None
-        reason_for_choice = ""
-        if dme_at_thr > 0 and dme_at_mapt > 0 and (dme_at_thr - dme_at_mapt) > 0.05:
-            chosen_distance = dme_at_thr - dme_at_mapt
-            reason_for_choice = "dme_at_thr - dme_at_mapt"
-        elif faf_mapt_dist > 0.05:
-            chosen_distance = faf_mapt_dist
-            reason_for_choice = "faf_mapt_dist (fallback)"
-        else:
-            # try distance from coordinate lat/lon if available
-            try:
-                if thr_lat and thr_lon and dme_lat and dme_lon:
-                    thr_lat_f = float(thr_lat); thr_lon_f = float(thr_lon)
-                    dme_lat_f = float(dme_lat); dme_lon_f = float(dme_lon)
-                    # distance DME->THR in NM using haversine
-                    dme_to_thr_nm = haversine_nm(dme_lat_f, dme_lon_f, thr_lat_f, thr_lon_f)
-                    if dme_at_mapt > 0:
-                        chosen_distance = dme_to_thr_nm - dme_at_mapt
-                    else:
-                        chosen_distance = dme_to_thr_nm
-                    reason_for_choice = "computed from lat/lon"
-            except Exception:
-                pass
-
-        if not chosen_distance or chosen_distance <= 0:
-            st.error("Cannot determine a valid horizontal distance (provide DME@THR & DME@MAPt or FAF->MAPt).")
-        else:
-            # compute initial GP angle
-            # Vertical drop from TOD to threshold reference height (thr_elev + 50ft as navblue uses ~50ft above threshold)
-            thr_ref = thr_elev + 50.0
-            vertical_drop = tod_alt - thr_ref
-            calc_angle = angle_from_height_and_distance(vertical_drop, chosen_distance)
-            # NAVBLUE rule: if calculated angle < 2.5°, raise to 3.0° for advisory tables
-            note_angle_original = calc_angle
-            if calc_angle is None:
-                st.error("Could not compute GP angle (invalid distances).")
-            else:
-                if calc_angle < 2.5:
-                    adjusted_angle = 3.0
-                    note = f"Calculated angle {calc_angle:.2f}° < 2.5°, NAVBLUE: raising to 3.0° for advisory table."
-                    gp_angle = adjusted_angle
-                else:
-                    gp_angle = calc_angle
-                    note = f"Calculated angle used: {gp_angle:.2f}°"
-                # If user provided gp_input, prefer that (manual override)
-                if gp_input.strip():
+# ----------------------
+# Utilities: PDF -> text/images
+# ----------------------
+def extract_text_from_pdf_bytes(data: bytes):
+    """Try pdfplumber text extraction first; if that fails and OCR available, return None
+    (caller may then attempt OCR)."""
+    if pdfplumber:
+        try:
+            with pdfplumber.open(BytesIO(data)) as pdf:
+                texts = []
+                for p in pdf.pages:
                     try:
-                        gp_angle = float(gp_input)
-                        note = f"Manual GP angle override used: {gp_angle:.2f}°"
-                    except:
-                        st.warning("Invalid manual GP angle ignored; using computed value.")
+                        t = p.extract_text() or ""
+                    except Exception:
+                        t = ""
+                    texts.append(t)
+                joined = "\n".join(texts).strip()
+                if joined:
+                    return joined
+        except Exception:
+            return None
+    return None
 
-                st.success(f"Using GP angle: {gp_angle:.2f}° — ({reason_for_choice}). {note}")
+def pdf_to_images_bytes(data: bytes, dpi=200):
+    """Convert PDF bytes to list of PIL images using pdf2image (requires poppler)."""
+    if convert_from_bytes is None:
+        raise RuntimeError("pdf2image.convert_from_bytes is not available.")
+    imgs = convert_from_bytes(data, dpi=dpi)
+    return [im.convert("RGB") for im in imgs]
 
-                # Generate DME table: 8 entries from TOD -> MAPt
-                # We will generate distances from starting DME (closest to TOD) to MAPt.
-                # Determine start_dme and end_dme:
-                # If we have dme_at_thr and chosen_distance was based on that, start_dme = dme_at_thr
-                # else if chosen_distance was FAF->MAPt fallback, we treat start_dme as mapt + chosen_distance
-                if reason_for_choice == "dme_at_thr - dme_at_mapt":
-                    start_dme = dme_at_thr
-                    end_dme = dme_at_mapt
-                elif reason_for_choice == "faf_mapt_dist (fallback)":
-                    # we only know FAF->MAPt; we treat start_dme = dme_at_mapt + faf_mapt_dist if dme_at_mapt known
-                    if dme_at_mapt > 0:
-                        start_dme = dme_at_mapt + faf_mapt_dist
-                        end_dme = dme_at_mapt
-                    else:
-                        # assume start_dme equals chosen_distance (relative), set end at 0
-                        start_dme = chosen_distance
-                        end_dme = 0.0
-                else:
-                    # computed from lat/lon previously
-                    if dme_at_mapt > 0:
-                        start_dme = dme_at_mapt + chosen_distance
-                        end_dme = dme_at_mapt
-                    else:
-                        start_dme = chosen_distance
-                        end_dme = 0.0
+def ocr_images_to_text(images):
+    """Run pytesseract OCR over list of PIL images and return concatenated text."""
+    if pytesseract is None:
+        raise RuntimeError("pytesseract not available for OCR.")
+    texts = []
+    for im in images:
+        try:
+            texts.append(pytesseract.image_to_string(im))
+        except Exception:
+            texts.append("")
+    return "\n".join(texts)
 
-                # Create 8 distance points with dynamic spacing:
-                # Use larger spacing early and smaller closer to runway (log spacing).
-                n_points = 8
-                # produce fractional positions t in [0,1] skewed to produce denser points near 0 (MAPt side)
-                t = np.linspace(0.0, 1.0, n_points)
-                # apply cubic ease-in to bias near MAPt: s = t^3 (keeps small gaps near runway)
-                s = t ** 1.8  # exponent between 1.5-2 gives desirable bias; tuned experimentally
-                dme_points = start_dme - (start_dme - end_dme) * s  # descending from start_dme -> end_dme
+# ----------------------
+# Chart parser heuristics (best-effort)
+# ----------------------
+class IACParserHeuristics:
+    re_mda = re.compile(r"\bMDA\b[^0-9]{0,6}([0-9]{3,4})\s*ft", re.IGNORECASE)
+    re_gp_explicit = re.compile(r"([23-6]\.?[0-9]?)\s*°\s*(gp|glide|glideslope|glide path)?", re.IGNORECASE)
+    re_dme_value = re.compile(r"([0-9]{1,2}\.[0-9])\s*NM", re.IGNORECASE)
+    re_coords = re.compile(r"(-?\d+\.\d+)[^\d-]{1,6}(-?\d+\.\d+)")
+    # Search for useful numbers: MDA, FAF/TO DME, MAPt DME, DME@THR, FAF alt (ft)
+    def parse(self, doc_text: str):
+        out = {}
+        if not doc_text:
+            return out
+        # MDA
+        m = self.re_mda.search(doc_text)
+        if m:
+            try:
+                out['mda_ft'] = int(m.group(1))
+            except:
+                pass
+        # explicit GP
+        m = self.re_gp_explicit.search(doc_text)
+        if m:
+            try:
+                gp_val = float(m.group(1))
+                # accept reasonable GP values (2.0 - 10.0) as hint
+                if 1.5 <= gp_val <= 10.0:
+                    out['gp_angle'] = gp_val
+            except:
+                pass
+        # DME numbers (first few matches)
+        dmes = self.re_dme_value.findall(doc_text)
+        if dmes:
+            # heuristics: first numeric NM often FAF/TOD; last small values maybe thresholds
+            floats = [float(x) for x in dmes]
+            out['dme_candidates'] = floats
+            # set first as tod/faf if not present
+            out.setdefault('tod_dme_nm', floats[0])
+            # try to find very small near 0.1-1.5 as MAPt or DME@THR
+            near_thr = [f for f in floats if f <= 2.0]
+            if near_thr:
+                out.setdefault('mapt_dme_nm', min(near_thr))
+        # coords
+        coords = self.re_coords.findall(doc_text)
+        if coords:
+            try:
+                lat, lon = coords[0]
+                out['thr_lat'] = float(lat)
+                out['thr_lon'] = float(lon)
+            except:
+                pass
+        # try to glean FAF altitude (e.g., 2500ft)
+        m_alt = re.search(r"FAF[^0-9]{0,6}([0-9]{3,4})\s*ft", doc_text, re.IGNORECASE)
+        if m_alt:
+            try:
+                out['faf_alt_ft'] = int(m_alt.group(1))
+            except:
+                pass
+        # procedure id guess
+        for line in doc_text.splitlines():
+            s = line.strip()
+            if s.isupper() and 3 < len(s) < 40 and any(ch.isalpha() for ch in s):
+                out.setdefault('procedure_id', s)
+                break
+        return out
 
-                # Build DME table altitudes by projecting along GP angle from TOD reference
-                # We'll compute altitude at each DME by: altitude = TOD_alt - vertical_rate_along_distance
-                # Vertical drop per NM = tan(angle) * NM_TO_FT
-                vertical_ft_per_nm = ft_per_nm_from_angle_deg(gp_angle)
+# ----------------------
+# CDFA core planner
+# ----------------------
+class CDFAPlanner:
+    def __init__(self,
+                 thr_elev_ft: float,
+                 mda_ft: float,
+                 dme_thr_nm: float,
+                 tod_dme_nm: float,
+                 mapt_dme_nm: float = None,
+                 gp_angle_user: float = 0.0,
+                 faf_alt_ft: float = None,
+                 sdf_list: list = None,
+                 thr_coords: tuple = None,
+                 dme_coords: tuple = None,
+                 gp_min=DEFAULT_GP_MIN,
+                 gp_max=DEFAULT_GP_MAX):
+        self.thr_elev_ft = float(thr_elev_ft)
+        self.mda_ft = float(mda_ft)
+        self.dme_thr_nm = float(dme_thr_nm)
+        self.tod_dme_nm = float(tod_dme_nm)
+        self.mapt_dme_nm = float(mapt_dme_nm) if mapt_dme_nm is not None else None
+        self.gp_angle_user = float(gp_angle_user) if gp_angle_user else 0.0
+        self.faf_alt_ft = float(faf_alt_ft) if faf_alt_ft else None
+        self.sdf_list = sdf_list or []
+        self.thr_coords = thr_coords
+        self.dme_coords = dme_coords
+        self.gp_min = gp_min
+        self.gp_max = gp_max
 
-                # Determine distance of start_dme -> each point in NM measured along horizontal axis
-                # For altitude reference we need distance from start to point: ds = start_dme - point_dme
-                dme_rows = []
-                for point in dme_points:
-                    ds_from_start = start_dme - point  # nm
-                    altitude_at_point = tod_alt - vertical_ft_per_nm * ds_from_start
-                    # Ensure not below MDA
-                    if altitude_at_point < mda:
-                        altitude_at_point = mda
-                    # NAVBLUE rounding: publish altitude rounded up to next 10 ft
-                    altitude_publish = round_to_10_up(altitude_at_point)
-                    dme_rows.append({"DME (NM)": float(format_nm(point)), "Altitude (FT)": altitude_publish})
+    def derive_gp_angle(self):
+        """Derive GP angle (deg). Preference order:
+        1) user-specified >0 and within allowed range (or override allowed)
+        2) derive from FAF altitude -> threshold elevation over horizontal distance (TOD - DME@THR)
+        3) fallback to DEFAULT_GP_FALLBACK
+        Returns (gp_angle_used, was_clamped(boolean), raw_angle)
+        """
+        # if user forced a positive gp_angle_user, return it (caller must decide if allowed)
+        if self.gp_angle_user and self.gp_angle_user > 0:
+            raw = self.gp_angle_user
+            clamped = False
+            used = raw
+            # clamp if outside allowed range
+            if raw < self.gp_min:
+                used = self.gp_min
+                clamped = True
+            elif raw > self.gp_max:
+                used = self.gp_max
+                clamped = True
+            return used, clamped, raw
 
-                # Guarantee last row altitude equals MDA (do not go below it)
-                dme_rows[-1]["Altitude (FT)"] = round_to_10_up(max(mda, dme_rows[-1]["Altitude (FT)"]))
+        # Build raw from FAF altitude (preferred) or from interpolated altitude at TOD
+        raw_angle = None
+        if self.faf_alt_ft is not None and self.tod_dme_nm is not None:
+            vert_drop = self.faf_alt_ft - self.thr_elev_ft
+            horiz_nm = max(0.001, self.tod_dme_nm - self.dme_thr_nm)  # horizontal from FAF to THR
+            horiz_ft = horiz_nm * NM_TO_FT
+            raw_angle = math.degrees(math.atan2(vert_drop, horiz_ft))
+        # if raw_angle invalid, fallback
+        if raw_angle is None or raw_angle <= 0 or raw_angle > 10:
+            raw_angle = DEFAULT_GP_FALLBACK
 
-                dme_df = pd.DataFrame(dme_rows)
+        # clamp into allowed range (safe)
+        clamped = False
+        used = raw_angle
+        if used < self.gp_min:
+            used = self.gp_min
+            clamped = True
+        elif used > self.gp_max:
+            used = self.gp_max
+            clamped = True
+        return round(used, 2), clamped, round(raw_angle, 2)
 
-                st.subheader("DIST/ALT (DME) Table — 8 points (TOD → MAPt)")
-                st.dataframe(dme_df)
+    def _slant_correction(self, dme_nm):
+        """If coordinates provided, correct slant vs horizontal.
+        For now returns horizontal-equivalent DME (placeholder for full slant calc).
+        If both thr_coords and dme_coords present, we can compute horizontal distance between station and THR,
+        then compute slant difference due to antenna height; here we leave simple (horizontal ~ DME)."""
+        # TODO: implement full slant-range correction if required (using antenna heights)
+        return max(0.0, dme_nm)
 
-                # ROD table: use FAF->MAPt distance for timing and ROD calculation
-                st.subheader("ROD Table (FAF → MAPt) — 5 GS")
-                # choose FAF->MAPt distance
-                if faf_mapt_dist and faf_mapt_dist > 0:
-                    rod_distance = faf_mapt_dist
-                else:
-                    # as fallback use chosen_distance
-                    rod_distance = chosen_distance
+    def generate_dme_points(self):
+        """Generate 8 DME points from TOD down to MAPt (or near threshold if MAPt missing).
+        Points are DME (NM from DME station) — descending from outer to inner.
+        We ensure first point equals TOD (or slightly adjusted) and last point near MAPt/DME@THR.
+        Spacing: denser near inner end (MDA) to allow sub-1NM near runway.
+        """
+        start = float(self.tod_dme_nm)
+        end = float(self.mapt_dme_nm) if self.mapt_dme_nm is not None else max(self.dme_thr_nm + 0.05, start - 0.05)
 
-                rod_rows = []
-                for gs in [80, 100, 120, 140, 160]:
-                    # ROD (ft/min) from angle & GS
-                    rod = rod_ft_per_min(gp_angle, gs)  # ft/min
-                    # Time to cover FAF->MAPt at GS: time_minutes = dist (nm) / GS (nm/hr) * 60
-                    time_minutes = (rod_distance / gs) * 60.0
-                    # Convert time to mm:ss
-                    minutes_int = int(math.floor(time_minutes))
-                    seconds_int = int(round((time_minutes - minutes_int) * 60))
-                    if seconds_int == 60:
-                        minutes_int += 1
-                        seconds_int = 0
-                    # ROD formatting: round to nearest whole ft/min and round to 10 for publication
-                    rod_publish = int(round(rod))
-                    rod_rows.append({"GS (kt)": gs, "ROD (ft/min)": rod_publish, "Time (MM:SS)": f"{minutes_int:02d}:{seconds_int:02d}"})
+        if start <= end:
+            # defensive: if start equals or inside end, ensure sensible start = end + 5 NM
+            start = end + max(1.0, (start - end) * -1.0 + 5.0)
 
-                rod_df = pd.DataFrame(rod_rows)
-                st.dataframe(rod_df)
+        # Create 8 points with denser spacing near end:
+        lin = np.linspace(0.0, 1.0, 8)
+        # use cubic-based easing to cluster near end: w = 1 - (1 - lin)^3  -> at lin=0 =>0, lin=1=>1
+        weights = 1.0 - (1.0 - lin) ** 3
+        # map weights 0..1 to dme from start..end
+        dmes = start + (end - start) * weights  # note end < start, so works
+        # ensure descending order (outer to inner)
+        dmes = np.clip(dmes, end, start)
+        # round to 1 decimal as requested
+        dmes = np.round(dmes, 1)
+        # ensure monotonic descending uniqueness (if duplicates due to small ranges, slightly adjust)
+        for i in range(1, len(dmes)):
+            if dmes[i] >= dmes[i - 1]:
+                dmes[i] = max(end, dmes[i - 1] - 0.1)
+        return dmes.tolist()
 
-                # Plot profile
-                st.subheader("Profile view")
-                fig, ax = plt.subplots(figsize=(9,4))
-                # Plot DME vs Altitude
-                ax.plot(dme_df["DME (NM)"], dme_df["Altitude (FT)"], marker="o", label="CDFA profile")
-                # Mark SDFs
-                for sdf in sdfs:
-                    if sdf["dme"] > 0 and sdf["alt"] > 0:
-                        ax.scatter([sdf["dme"]], [sdf["alt"]], marker="x", color="red", label="SDF")
-                        ax.text(sdf["dme"], sdf["alt"], f" SDF\n{format_nm(sdf['dme'])}NM\n{int(sdf['alt'])}ft", fontsize=8)
-                # MDA line
-                ax.axhline(y=mda, color="red", linestyle="--", label="MDA")
-                ax.set_xlabel("DME (NM to/from THR)")
-                ax.set_ylabel("Altitude (FT)")
-                ax.set_title(f"CDFA Profile — GP {gp_angle:.2f}°")
-                ax.invert_xaxis()  # conventional profile (distance decreases towards runway)
-                ax.grid(True)
-                ax.legend(loc="upper right")
-                st.pyplot(fig)
+    def dme_table_and_alts(self, gp_angle_deg):
+        """Return pandas DataFrame of 8 rows: DME(NM), Alt(ft), Distance to THR (NM)"""
+        dmes = self.generate_dme_points()
+        rows = []
+        for d in dmes:
+            d_corr = self._slant_correction(d)
+            dist_to_thr = max(0.0, d_corr - self.dme_thr_nm)
+            horiz_ft = dist_to_thr * NM_TO_FT
+            alt_ft = self.thr_elev_ft + math.tan(math.radians(gp_angle_deg)) * horiz_ft
+            rows.append({"DME (NM)": round(d_corr, 1),
+                         "Distance to THR (NM)": round(dist_to_thr, 2),
+                         "Altitude (ft)": round(alt_ft, 0)})
+        # sort outer -> inner (descending DME)
+        df = pd.DataFrame(rows).sort_values(by="DME (NM)", ascending=False).reset_index(drop=True)
+        return df
 
-                # CSV export
-                csv_dme = dme_df.to_csv(index=False).encode("utf-8")
-                st.download_button("Download DME Table (CSV)", csv_dme, "dme_table.csv", "text/csv")
-                csv_rod = rod_df.to_csv(index=False).encode("utf-8")
-                st.download_button("Download ROD Table (CSV)", csv_rod, "rod_table.csv", "text/csv")
+    def generate_rod_table(self, dme_df, gs_list_kts=[80,100,120,140,160]):
+        """Compute ROD (ft/min) per ground speed for total descent (FAF->MAPt).
+        We calculate time per DME segment and ROD per segment, then average weighted by time."""
+        dme = dme_df["DME (NM)"].values
+        alt = dme_df["Altitude (ft)"].values
+        seg_dist_nm = np.abs(np.diff(dme))  # between consecutive points
+        seg_alt_ft = np.abs(np.diff(alt))
+        results = []
+        for gs in gs_list_kts:
+            nm_per_min = gs * KTS_TO_NM_PER_MIN  # gs / 60
+            # per segment time (min)
+            times_min = np.where(seg_dist_nm > 0, seg_dist_nm / nm_per_min, 0.0)
+            total_time_min = times_min.sum()
+            total_alt_ft = seg_alt_ft.sum()
+            avg_rod = (total_alt_ft / total_time_min) if total_time_min > 0 else 0.0
+            # format MM:SS for total_time
+            total_seconds = int(round(total_time_min * 60.0))
+            mm = total_seconds // 60
+            ss = total_seconds % 60
+            results.append({"GS (kt)": int(gs), "ROD (ft/min)": int(round(avg_rod)), "Time (MM:SS)": f"{mm:02d}:{ss:02d}"})
+        return pd.DataFrame(results)
 
-                # PDF export using reportlab
-                def create_pdf_bytes(dme_df, rod_df, gp_angle):
-                    buf = io.BytesIO()
-                    doc = SimpleDocTemplate(buf, pagesize=A4)
-                    styles = getSampleStyleSheet()
-                    elems = []
+    def plot_profile(self, dme_df, gp_angle_deg):
+        # Plot Distance-to-THR on X (in NM), Altitude on Y (ft), MDA line, SDF markers
+        x = dme_df["Distance to THR (NM)"].values  # NM to/from THR
+        y = dme_df["Altitude (ft)"].values
+        fig, ax = plt.subplots(figsize=(12,5))
+        ax.plot(x, y, marker='o', linestyle='-', linewidth=2, label='CDFA profile')
+        ax.invert_xaxis()  # show outer (large) on left to inner on right
+        ax.set_xlabel("DME (NM to/from THR)")
+        ax.set_ylabel("Altitude (FT)")
+        ax.set_title(f"CDFA Profile — GP {gp_angle_deg:.2f}°")
 
-                    title = Paragraph("CDFA PLANNER — Output", styles["Title"])
-                    elems.append(title)
-                    elems.append(Paragraph(f"Generated: {datetime.datetime.utcnow().isoformat()} UTC", styles["Normal"]))
-                    elems.append(Spacer(1, 8))
-                    elems.append(Paragraph(f"GP angle used: {gp_angle:.2f}°", styles["Normal"]))
-                    elems.append(Spacer(1, 8))
-
-                    elems.append(Paragraph("DIST/ALT (DME) Table", styles["Heading2"]))
-                    dme_data = [list(dme_df.columns)] + dme_df.values.tolist()
-                    t = Table(dme_data, colWidths=[90, 90])
-                    t.setStyle(TableStyle([
-                        ("GRID", (0,0), (-1,-1), 0.5, colors.black),
-                        ("BACKGROUND", (0,0), (-1,0), colors.lightgrey)
-                    ]))
-                    elems.append(t)
-                    elems.append(Spacer(1, 12))
-
-                    elems.append(Paragraph("ROD Table", styles["Heading2"]))
-                    rod_data = [list(rod_df.columns)] + rod_df.values.tolist()
-                    t2 = Table(rod_data, colWidths=[70, 90, 90])
-                    t2.setStyle(TableStyle([
-                        ("GRID", (0,0), (-1,-1), 0.5, colors.black),
-                        ("BACKGROUND", (0,0), (-1,0), colors.lightgrey)
-                    ]))
-                    elems.append(t2)
-                    elems.append(Spacer(1, 12))
-
-                    doc.build(elems)
-                    pdfbytes = buf.getvalue()
-                    buf.close()
-                    return pdfbytes
-
-                pdf_bytes = create_pdf_bytes(dme_df, rod_df, gp_angle)
-                st.download_button("Download PDF (CDFA output)", data=pdf_bytes, file_name="cdfa_output.pdf", mime="application/pdf")
 
 
 
