@@ -7,6 +7,7 @@ Features:
 - Profile chart in UI & PDF
 - NavBlue-style A4 landscape PDF (DME table left, ROD summary right, profile below)
 - FAA/EASA GP guards
+- CSV download for both tables
 """
 
 import streamlit as st
@@ -193,13 +194,23 @@ if st.button("Generate Tables & PDF"):
     sdf_dmes = [d for _, d in sdf_list]
     dme_with_flags = insert_sdfs(dme_points, sdf_dmes)
     alts = compute_altitudes([p for p, _ in dme_with_flags], gp_used, mda_ft, mapt_dme)
-    dme_df = pd.DataFrame({"DME (NM)": [p for p, _ in dme_with_flags], "Distance to THR (NM)": [p - dme_at_thr for p, _ in dme_with_flags], "Altitude (ft)": alts, "SDF": ["Yes" if is_sdf else "" for _, is_sdf in dme_with_flags]})
+
+    dme_df = pd.DataFrame({
+        "DME (NM)": [p for p, _ in dme_with_flags],
+        "Distance to THR (NM)": [round1(p - dme_at_thr) for p, _ in dme_with_flags],
+        "Altitude (ft)": alts,
+        "SDF": ["Yes" if is_sdf else "" for _, is_sdf in dme_with_flags]
+    })
+
     rod_df = compute_rod_summary(faf_mapt, tod_alt, mda_ft, DEFAULT_GS_PRESET)
 
     st.subheader("DME Table")
     st.dataframe(dme_df)
+    st.download_button("Download DME Table CSV", dme_df.to_csv(index=False), file_name=f"{proc_id}_DME_Table.csv", mime="text/csv")
+
     st.subheader("ROD Summary Table")
     st.dataframe(rod_df)
+    st.download_button("Download ROD Summary CSV", rod_df.to_csv(index=False), file_name=f"{proc_id}_ROD_Summary.csv", mime="text/csv")
 
     fig, ax = plt.subplots(figsize=(8, 3))
     ax.plot(dme_df["DME (NM)"], dme_df["Altitude (ft)"], marker="o")
@@ -217,6 +228,7 @@ if st.button("Generate Tables & PDF"):
 
     for w in warnings:
         st.warning(w)
+
 
 
 
