@@ -5,7 +5,7 @@ FROM python:3.11-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
     libglib2.0-0 \
-    ttf-dejavu \
+    fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
 # Set workdir
@@ -30,6 +30,7 @@ EXPOSE 7860
 
 # Run Streamlit app
 CMD ["streamlit", "run", "app.py"]
+
 
 
 
